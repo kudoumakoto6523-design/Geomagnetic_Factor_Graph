@@ -1,0 +1,54 @@
+clc
+clear
+close all
+X = 50;
+Y = 50;
+std_noise = 0.5;
+errstp = 0.01;
+errang = 0.01;
+
+
+readstep_container = [];
+readangle_container = [];
+readmag_container = [];
+
+baseMap = Geometric_Map_Generator(2, [X, Y]);
+
+[xi,yi] = meshgrid(linspace(1,X,200), linspace(1,Y,200)); 
+[xx,yy] = meshgrid(1:X,1:Y);
+baseMap_smooth = interp2(xx,yy,baseMap,xi,yi,'cubic'); 
+figure(1)
+imagesc(baseMap_smooth)
+colormap(parula);        
+shading interp;          
+colorbar  
+set(gca,'GridAlpha',0,'Box','on'); 
+title('随机生成的地磁指纹图，无任何分布特点');
+
+%% START SIMULATION
+init_point = [X * rand(), Y * rand()];
+for i = 1:100
+   [readstep, realstep] = rad_gen_steplen('cons', errstp);
+   readstep_container = [readstep_container, readstep];
+   [readangle, realangle] = rad_gen_angle();
+   readangle_container = [readangle_container, readangle];
+   [readmag, realmag] = rad_gen_realmag(init_point, realstep, realangle, std_noise); % generate a random x and y
+   readmag_container = [readmag_container, readmag];
+   [ex, ey] = mainalgr(init_point, readstep, realangle, realmag, baseMap_smooth);
+end
+
+%% DRAW FIGURES
+% TODO
+
+%% FUNCS
+
+function [readstep, realstep] = rad_gen_steplen(consornot, err)
+    if consornot == 'cons'
+        realstep = 1;
+        readstep = 1 + 2*rand() - 1;
+
+    end
+end
+
+
+
