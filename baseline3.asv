@@ -63,11 +63,6 @@ pdr_pos = init_pos;
 pdr_path = pdr_pos;
 pdr_heading = 0;    
 
-
-sigma_mag    = std_mag_noise;  % magnetic measurement STD
-sigma_step   = 0.04;           
-sigma_dangle = 0.05;           
-
 % Data Containers
 store_steps = [];
 store_dangles = [];
@@ -123,12 +118,9 @@ for i = 1:total_steps
     meas_mag = true_mag_val + std_mag_noise * randn();
     store_mags = [store_mags; meas_mag];
     
-
-
-[est_traj_gpu, last_w, last_v] = mainalgr_gpu(init_pos, store_steps, store_dangles, store_mags, ...
-                                             g_map, g_grid_x, g_grid_y, last_w, last_v, ...
-                                             sigma_mag, sigma_step, sigma_dangle);
-
+    %% E. FGLC Optimization (GPU + Warm Start)
+    [est_traj_gpu, last_w, last_v] = mainalgr_gpu(init_pos, store_steps, store_dangles, store_mags, ...
+                                             g_map, g_grid_x, g_grid_y, last_w, last_v);
     
     est_traj = gather(est_traj_gpu);
     
@@ -144,19 +136,12 @@ close(hWait);
 fprintf('Simulation Complete.\n');
 
 %% --- GPU Optimized Algorithm ---
-function [est_traj, w_out, v_out] = mainalgr_gpu(start_pos, steps, angles, mags, g_map, g_x, g_y, w_init, v_init, ...
-                                                 sigma_mag, sigma_step, sigma_dangle)
-
+function [est_traj, w_out, v_out] = mainalgr_gpu(start_pos, steps, angles, mags, g_map, g_x, g_y, w_init, v_init)
     N = length(steps);
     
     % Constraints
-    sigma_mag_g    = gpuArray(single(sigma_mag));
-    sigma_step_g   = gpuArray(single(sigma_step));
-    sigma_dangle_g = gpuArray(single(sigma_dangle));
-    
-    delta_step   = gpuArray(single(3*sigma_step));     % δ_step = 3σ_step
-    delta_dangle = gpuArray(single(3*sigma_dangle));   % δ_Dangle = 3σ_Dangle
-
+    d_step = gpuArray(single(3 * 0.4)); 
+    d_theta = gpuArray(single(3 * 0.3)); % Slightly relaxed heading constraint
     
     % Move inputs to GPU
     steps_g = gpuArray(single(steps));
@@ -185,9 +170,8 @@ function [est_traj, w_out, v_out] = mainalgr_gpu(start_pos, steps, angles, mags,
     
     for iter = 1:iter_max
         % Variable Mapping
-        step_adj  = (2/pi) * delta_step   * atan(w);
-        theta_adj = (2/pi) * delta_dangle * atan(v);
-
+        step_adj = (2/pi) * d_step * atan(w);
+        theta_adj = (2/pi) * d_theta * atan(v);
         
         curr_steps = steps_g + step_adj;
         curr_theta = cumsum(angles_g + theta_adj);
@@ -211,8 +195,7 @@ function [est_traj, w_out, v_out] = mainalgr_gpu(start_pos, steps, angles, mags,
         my_m = interp2(g_x, g_y, g_map, qx, qy-d, 'linear', 0);
         dm_dy = (my_p - my_m) / (2*d);
         
-        residual = (2 / (sigma_mag_g^2)) * (mag_vals - mags_g);
-
+        residual = 2 * (mag_vals - mags_g);
         
         % Backpropagation
         grad_w = zeros(N, 1, 'single', 'gpuArray');
@@ -240,20 +223,11 @@ function [est_traj, w_out, v_out] = mainalgr_gpu(start_pos, steps, angles, mags,
         end
         
         % Constants & Update
-        dw_const = (2/pi) * delta_step   ./ (1 + w.^2);    % d(step_adj)/dw
-        dv_const = (2/pi) * delta_dangle ./ (1 + v.^2);    % d(theta_adj)/dv
+        dw_const = (2/pi) * d_step ./ (1 + w.^2);
+        dv_const = (2/pi) * d_theta ./ (1 + v.^2);
         
-        % ---- ADD THE MISSING FACTOR COST GRADIENTS (Eq. 40 / 44) ----
-        % Step factor: derivative of (step_adj^2 / sigma_step^2)
-        grad_w = grad_w + (2 / (sigma_step_g^2)) * step_adj;
-        
-        % Dangle factor: derivative of (theta_adj^2 / sigma_dangle^2)
-        grad_v = grad_v + (2 / (sigma_dangle_g^2)) * theta_adj;
-        
-        % Chain rule to mapped variables w,v
         grad_w = grad_w .* dw_const;
         grad_v = grad_v .* dv_const;
-
         
         m_w = beta1 * m_w + (1-beta1) * grad_w;
         v_w = beta2 * v_w + (1-beta2) * grad_w.^2;

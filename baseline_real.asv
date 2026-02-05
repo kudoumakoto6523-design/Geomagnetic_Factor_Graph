@@ -1,0 +1,355 @@
+clc; clear; close all;
+
+%% -------------------- GPU CHECK --------------------
+if gpuDeviceCount == 0
+    error('No GPU detected. This code requires a GPU and the Parallel Computing Toolbox.');
+else
+    d = gpuDevice;
+    fprintf('Running on GPU: %s\n', d.Name);
+end
+
+%% -------------------- 1) Load real-world .mat --------------------
+T1 = load('test1_inputs_fixed_he.mat');
+T2 = load('test2_inputs_fixed.mat');
+
+%% -------------------- 2) Your 7x5 magnetic tile map --------------------
+tile_mag_7x5 = [ ...
+    0.0400, 0.0330, 0.0250, 0.0245, 0.0450; ...
+    0.0360, 0.0300, 0.0280, 0.0300, 0.0210; ...
+    0.0280, 0.0330, 0.0460, 0.0540, 0.0530; ...
+    0.0530, 0.0406, 0.0520, 0.0524, 0.0428; ...
+    0.0510, 0.0490, 0.0400, 0.0345, 0.0536; ...
+    0.0445, 0.0435, 0.0488, 0.0508, 0.0720; ...
+    0.0500, 0.0620, 0.0670, 0.0430, 0.0770  ...
+];
+
+%% -------------------- 3) Kriging interpolation (fitrgp) -> dense map --------------------
+% Coordinate convention consistent with your stated truth:
+% x = 1..5 (columns), y = 1..7 (rows)
+[xn, yn] = meshgrid(1:5, 1:7);
+XY = [xn(:), yn(:)];
+Z  = tile_mag_7x5(:);
+
+fprintf('Fitting Kriging (GPR) model...\n');
+gprMdl = fitrgp(XY, Z, ...
+    'Basis','constant', ...
+    'KernelFunction','ardsquaredexponential', ...
+    'Sigma', 1e-6, ...           % near-interpolation
+    'Standardize', true, ...
+    'FitMethod','exact', ...
+    'PredictMethod','exact');
+
+% Dense grid (for smooth gradients + stable interp2)
+Nx = 250; Ny = 350;
+grid_x = linspace(1, 5, Nx);
+grid_y = linspace(1, 7, Ny);
+[xi, yi] = meshgrid(grid_x, grid_y);
+
+Zq = predict(gprMdl, [xi(:), yi(:)]);
+baseMap_smooth = reshape(Zq, size(xi));
+
+% Move static map data to GPU once (same as your code)
+g_map    = gpuArray(single(baseMap_smooth));
+g_grid_x = gpuArray(single(grid_x));
+g_grid_y = gpuArray(single(grid_y));
+
+%% -------------------- 4) Hyper-parameters (keep your style) --------------------
+% NOTE: 你原来写的注释“sigma_step=0.04 -> delta=1.2”是错的。
+% 你旧代码 d_step=3*0.4 => sigma_step=0.4; d_theta=3*0.3 => sigma_dangle=0.3
+sigma_step   = 0.4;
+sigma_dangle = 0.3;
+
+% sigma_mag 用数据自适应（比你写死 std_mag_noise 更合理，因为这里单位是 0.0x）
+% 后面每个 test 会单独算一次
+
+%% -------------------- 5) Visualization Setup (same style) --------------------
+figure(1);
+imagesc(grid_x, grid_y, baseMap_smooth);
+colormap(parula); shading interp; colorbar;
+set(gca, 'YDir', 'normal'); hold on; axis equal tight;
+title('Real Data FGLC (Kriging Map) + Warm Start');
+xlabel('X'); ylabel('Y');
+
+h_truth1 = plot(NaN,NaN,'k-','LineWidth',2,'DisplayName','Truth (test1)');
+h_pdr1   = plot(NaN,NaN,'g--','LineWidth',1.5,'DisplayName','PDR (test1)');
+h_est1   = plot(NaN,NaN,'r.-','LineWidth',2,'DisplayName','FGLC (test1)');
+
+h_truth2 = plot(NaN,NaN,'k-','LineWidth',2,'DisplayName','Truth (test2)');
+h_pdr2   = plot(NaN,NaN,'g--','LineWidth',1.5,'DisplayName','PDR (test2)');
+h_est2   = plot(NaN,NaN,'r.-','LineWidth',2,'DisplayName','FGLC (test2)');
+
+legend('Location','bestoutside');
+
+%% -------------------- 6) Define your NEW ground-truth routes --------------------
+truth1_start = [1, 1]; truth1_end = [5, 1];
+truth2_start = [4, 1]; truth2_end = [4, 7];
+
+%% -------------------- 7) Run TEST1 (auto pick +/-90 based on your truth) --------------------
+fprintf('\n===== TEST1 =====\n');
+[steps1, dangles1, mags1] = read_inputs(T1);
+sigma_mag1 = max(1e-6, std(mags1));   % data-adaptive
+
+fprintf('Raw steps1:    %s\n', mat2str(steps1',6));
+fprintf('Raw dangles1:  %s\n', mat2str(dangles1',6));
+fprintf('Raw mags1:     %s\n', mat2str(mags1',6));
+fprintf('sigma_mag1=%.6g, sigma_step=%.3g, sigma_dangle=%.3g\n', sigma_mag1, sigma_step, sigma_dangle);
+
+offset1 = pick_offset_90deg(steps1, dangles1, truth1_start, truth1_end);
+fprintf('Chosen heading offset for TEST1: %.1f deg\n', offset1*180/pi);
+
+dangles1_fix = apply_heading_offset(dangles1, offset1);
+
+% Build PDR traj (for plotting)
+pdr1 = build_traj(truth1_start, steps1, dangles1_fix);
+
+% Run incremental warm-start FGLC (exactly your “store_... + last_w/v” pattern)
+[est1, w1, v1] = run_incremental_fglc(truth1_start, steps1, dangles1_fix, mags1, ...
+    g_map, g_grid_x, g_grid_y, sigma_mag1, sigma_step, sigma_dangle);
+
+% Truth line (since you now redefine truth)
+truth1 = [truth1_start; linspace(truth1_start(1), truth1_end(1), numel(steps1)+1)', ...
+                      linspace(truth1_start(2), truth1_end(2), numel(steps1)+1)'];
+truth1 = [truth1(:,1), truth1(:,2)];
+
+% Update plots
+set(h_truth1,'XData',truth1(:,1),'YData',truth1(:,2));
+set(h_pdr1,'XData',pdr1(:,1),'YData',pdr1(:,2));
+set(h_est1,'XData',est1(:,1),'YData',est1(:,2));
+drawnow;
+
+% Save fixed inputs (optional)
+save('test1_inputs_fixed_heading.mat', ...
+    'steps1','dangles1','dangles1_fix','mags1','truth1_start','truth1_end','pdr1','est1','offset1');
+
+%% -------------------- 8) Run TEST2 (auto pick +/-90 based on your truth) --------------------
+fprintf('\n===== TEST2 =====\n');
+[steps2, dangles2, mags2] = read_inputs(T2);
+sigma_mag2 = max(1e-6, std(mags2));
+
+fprintf('Raw steps2:    %s\n', mat2str(steps2',6));
+fprintf('Raw dangles2:  %s\n', mat2str(dangles2',6));
+fprintf('Raw mags2:     %s\n', mat2str(mags2',6));
+fprintf('sigma_mag2=%.6g, sigma_step=%.3g, sigma_dangle=%.3g\n', sigma_mag2, sigma_step, sigma_dangle);
+
+offset2 = pick_offset_90deg(steps2, dangles2, truth2_start, truth2_end);
+fprintf('Chosen heading offset for TEST2: %.1f deg\n', offset2*180/pi);
+
+dangles2_fix = apply_heading_offset(dangles2, offset2);
+
+pdr2 = build_traj(truth2_start, steps2, dangles2_fix);
+
+[est2, w2, v2] = run_incremental_fglc(truth2_start, steps2, dangles2_fix, mags2, ...
+    g_map, g_grid_x, g_grid_y, sigma_mag2, sigma_step, sigma_dangle);
+
+truth2 = [truth2_start; linspace(truth2_start(1), truth2_end(1), numel(steps2)+1)', ...
+                      linspace(truth2_start(2), truth2_end(2), numel(steps2)+1)'];
+truth2 = [truth2(:,1), truth2(:,2)];
+
+set(h_truth2,'XData',truth2(:,1),'YData',truth2(:,2));
+set(h_pdr2,'XData',pdr2(:,1),'YData',pdr2(:,2));
+set(h_est2,'XData',est2(:,1),'YData',est2(:,2));
+drawnow;
+
+save('test2_inputs_fixed_heading.mat', ...
+    'steps2','dangles2','dangles2_fix','mags2','truth2_start','truth2_end','pdr2','est2','offset2');
+
+fprintf('\nAll done.\n');
+
+%% =====================================================================
+%% -------------------- Helper: read inputs (from your inputs.mat) --------------------
+function [steps, dangles, mags] = read_inputs(T)
+    steps   = double(T.pdr_steps(:));
+    dangles = double(T.pdr_dangles(:));
+    mags    = double(T.mag_measurements(:));
+end
+
+%% -------------------- Helper: wrapToPi (no toolbox needed) --------------------
+function a = wrapToPi_local(a)
+    a = mod(a + pi, 2*pi) - pi;
+end
+
+%% -------------------- Helper: apply global heading offset via dangles(1) --------------------
+function d_fix = apply_heading_offset(d, offset_rad)
+    d_fix = d;
+    d_fix(1) = wrapToPi_local(d_fix(1) + offset_rad);
+end
+
+%% -------------------- Helper: build PDR trajectory from steps + cumsum(dangles) --------------------
+function traj = build_traj(start_xy, steps, dangles)
+    th = cumsum(dangles);
+    N = numel(steps);
+    traj = zeros(N+1,2);
+    traj(1,:) = start_xy(:)';
+    for k = 1:N
+        traj(k+1,:) = traj(k,:) + steps(k) * [cos(th(k)), sin(th(k))];
+    end
+end
+
+%% -------------------- Helper: choose best offset in {0, +90, -90} to match truth direction --------------------
+function offset = pick_offset_90deg(steps, dangles, truth_start, truth_end)
+    truth_disp = truth_end(:) - truth_start(:);
+    truth_dir  = truth_disp / (norm(truth_disp) + 1e-12);
+
+    candidates = [0, +pi/2, -pi/2];
+    bestScore = -inf;
+    offset = 0;
+
+    for c = candidates
+        d2 = dangles;
+        d2(1) = wrapToPi_local(d2(1) + c);
+        traj = build_traj(truth_start, steps, d2);
+        disp_vec = traj(end,:)' - traj(1,:)';
+        disp_dir = disp_vec / (norm(disp_vec) + 1e-12);
+
+        score = truth_dir' * disp_dir; % dot product: 1 best, -1 worst
+        if score > bestScore
+            bestScore = score;
+            offset = c;
+        end
+    end
+end
+
+%% -------------------- Helper: incremental warm-start run (matches your style) --------------------
+function [est_traj, last_w, last_v] = run_incremental_fglc(init_pos, steps, dangles, mags, ...
+    g_map, g_grid_x, g_grid_y, sigma_mag, sigma_step, sigma_dangle)
+
+    store_steps = [];
+    store_dangles = [];
+    store_mags = [];
+    last_w = [];
+    last_v = [];
+
+    N = numel(steps);
+    for i = 1:N
+        store_steps   = [store_steps;   steps(i)];
+        store_dangles = [store_dangles; dangles(i)];
+        store_mags    = [store_mags;    mags(i)];
+
+        [est_traj_gpu, last_w, last_v] = mainalgr_gpu(init_pos, store_steps, store_dangles, store_mags, ...
+            g_map, g_grid_x, g_grid_y, last_w, last_v, sigma_mag, sigma_step, sigma_dangle);
+
+        est_traj = gather(est_traj_gpu);
+    end
+end
+
+%% =====================================================================
+%% -------------------- Your GPU Optimized Algorithm (kept in your style) --------------------
+function [est_traj, w_out, v_out] = mainalgr_gpu(start_pos, steps, angles, mags, g_map, g_x, g_y, w_init, v_init, ...
+                                                 sigma_mag, sigma_step, sigma_dangle)
+
+    N = length(steps);
+
+    % Constraints
+    sigma_mag_g    = gpuArray(single(sigma_mag));
+    sigma_step_g   = gpuArray(single(sigma_step));
+    sigma_dangle_g = gpuArray(single(sigma_dangle));
+
+    delta_step   = gpuArray(single(3*sigma_step));     % δ_step = 3σ_step
+    delta_dangle = gpuArray(single(3*sigma_dangle));   % δ_Dangle = 3σ_Dangle
+
+    % Move inputs to GPU
+    steps_g  = gpuArray(single(steps));
+    angles_g = gpuArray(single(angles));
+    mags_g   = gpuArray(single(mags));
+
+    lr = 0.05;
+    iter_max = 200;   % real data: slightly more iterations helps
+
+    % Warm Start Initialization
+    if isempty(w_init)
+        w = zeros(N, 1, 'single', 'gpuArray');
+        v = zeros(N, 1, 'single', 'gpuArray');
+    else
+        w = [w_init; 0];
+        v = [v_init; 0];
+    end
+
+    m_w = zeros(size(w), 'single', 'gpuArray'); v_w = m_w;
+    m_v = zeros(size(v), 'single', 'gpuArray'); v_v = m_v;
+
+    beta1 = 0.9; beta2 = 0.999; eps_val = 1e-8;
+
+    sp_x = gpuArray(single(start_pos(1)));
+    sp_y = gpuArray(single(start_pos(2)));
+
+    for iter = 1:iter_max
+        % Variable Mapping (hard bounded)
+        step_adj  = (2/pi) * delta_step   * atan(w);
+        theta_adj = (2/pi) * delta_dangle * atan(v);
+
+        curr_steps = steps_g + step_adj;
+        curr_theta = cumsum(angles_g + theta_adj);
+
+        % Path Reconstruction
+        px = sp_x + cumsum(curr_steps .* cos(curr_theta));
+        py = sp_y + cumsum(curr_steps .* sin(curr_theta));
+
+        % Map Gradients (finite difference)
+        d = 0.15; % smaller than 0.5 because your map is only 1..5 / 1..7
+        qx = px(:); qy = py(:);
+
+        mag_vals = interp2(g_x, g_y, g_map, qx, qy, 'linear', 0);
+
+        mx_p = interp2(g_x, g_y, g_map, qx+d, qy, 'linear', 0);
+        mx_m = interp2(g_x, g_y, g_map, qx-d, qy, 'linear', 0);
+        dm_dx = (mx_p - mx_m) / (2*d);
+
+        my_p = interp2(g_x, g_y, g_map, qx, qy+d, 'linear', 0);
+        my_m = interp2(g_x, g_y, g_map, qx, qy-d, 'linear', 0);
+        dm_dy = (my_p - my_m) / (2*d);
+
+        % sigma-weighted magnetic residual
+        residual = (2 / (sigma_mag_g^2)) * (mag_vals - mags_g);
+
+        % Backpropagation
+        grad_w = zeros(N, 1, 'single', 'gpuArray');
+        grad_v = zeros(N, 1, 'single', 'gpuArray');
+
+        term_x = residual .* dm_dx;
+        term_y = residual .* dm_dy;
+
+        for k = 1:N
+            % Step Gradient (w.r.t step_adj)
+            grad_w(k) = sum(term_x(k:end)) * cos(curr_theta(k)) + ...
+                        sum(term_y(k:end)) * sin(curr_theta(k));
+
+            % Heading Gradient (w.r.t theta_adj)
+            if k == 1
+                pk_x = sp_x; pk_y = sp_y;
+            else
+                pk_x = px(k-1); pk_y = py(k-1);
+            end
+
+            rx = px(k:end) - pk_x;
+            ry = py(k:end) - pk_y;
+
+            grad_v(k) = sum(term_x(k:end) .* (-ry) + term_y(k:end) .* (rx));
+        end
+
+        % Chain rule constants
+        dw_const = (2/pi) * delta_step   ./ (1 + w.^2);    % d(step_adj)/dw
+        dv_const = (2/pi) * delta_dangle ./ (1 + v.^2);    % d(theta_adj)/dv
+
+        % ---- ADD MISSING FACTOR COST GRADIENTS (paper step/dangle penalties) ----
+        % derivative wrt (step_adj/theta_adj) first
+        grad_w = grad_w + (2 / (sigma_step_g^2))   * step_adj;
+        grad_v = grad_v + (2 / (sigma_dangle_g^2)) * theta_adj;
+
+        % now map to w,v space
+        grad_w = grad_w .* dw_const;
+        grad_v = grad_v .* dv_const;
+
+        % Adam update
+        m_w = beta1 * m_w + (1-beta1) * grad_w;
+        v_w = beta2 * v_w + (1-beta2) * grad_w.^2;
+        w = w - lr * m_w ./ (sqrt(v_w) + eps_val);
+
+        m_v = beta1 * m_v + (1-beta1) * grad_v;
+        v_v = beta2 * v_v + (1-beta2) * grad_v.^2;
+        v = v - lr * m_v ./ (sqrt(v_v) + eps_val);
+    end
+
+    est_traj = [[sp_x, sp_y]; px, py];
+    w_out = w;
+    v_out = v;
+end
